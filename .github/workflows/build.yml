@@ -1,0 +1,192 @@
+name: Build, test and release
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore: [ '**.md', 'docs/**' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  VERSION: 1.0.${{ github.run_number }}
+  BUILD: ${{ github.run_number }}
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Fetch Wintun (checksum-verified)
+        run: go run ./tools/fetchwintun
+
+      - name: Vet and unit tests
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Exe resources (icon, admin manifest, version)
+        working-directory: cmd/warpgo
+        run: |
+          go install github.com/tc-hib/go-winres@v0.3.3
+          go-winres make --in ../../winres/winres.json --arch amd64 --product-version "$env:VERSION.0" --file-version "$env:VERSION.0"
+
+      - name: Build WarpGo.exe
+        env:
+          BAKED_WG: ${{ secrets.WARP_WG_ACCOUNT_B64 }}
+          BAKED_MASQUE: ${{ secrets.WARP_MASQUE_ACCOUNT_B64 }}
+        run: |
+          $pkg = "github.com/iknalos/WarpGo-Windows/internal/app"
+          $ld = "-H windowsgui -s -w -X main.version=$env:VERSION -X main.build=$env:BUILD -X $pkg.bakedWg=$env:BAKED_WG -X $pkg.bakedMasque=$env:BAKED_MASQUE"
+          go build -trimpath -ldflags $ld -o dist/WarpGo.exe ./cmd/warpgo
+          if (-not $env:BAKED_WG) { Write-Warning "no built-in WARP accounts (secrets missing)" }
+          Get-Item dist/WarpGo.exe | Format-List Name, Length
+
+      - name: Test accounts from secrets
+        env:
+          BAKED_WG: ${{ secrets.WARP_WG_ACCOUNT_B64 }}
+          BAKED_MASQUE: ${{ secrets.WARP_MASQUE_ACCOUNT_B64 }}
+        run: |
+          if (-not $env:BAKED_WG) { Write-Warning "no account secrets: the tests register fresh accounts"; exit 0 }
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\wg.json", [Convert]::FromBase64String($env:BAKED_WG))
+          [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\masque.json", [Convert]::FromBase64String($env:BAKED_MASQUE))
+          "ACCOUNTS=--wg-account `"$env:RUNNER_TEMP\wg.json`" --masque-account `"$env:RUNNER_TEMP\masque.json`"" >> $env:GITHUB_ENV
+
+      # Every option must carry a DNS answer through an in-memory tunnel.
+      - name: Connection tests (all five options)
+        run: |
+          $p = Start-Process dist\WarpGo.exe -ArgumentList "--test --log $env:RUNNER_TEMP\test.log $env:ACCOUNTS" -Wait -PassThru -NoNewWindow
+          Get-Content "$env:RUNNER_TEMP\test.log" | Select-String -Pattern "probe |status:"
+          if ($p.ExitCode -ne 0) { throw "tests failed" }
+          $ok = (Select-String -Path "$env:RUNNER_TEMP\test.log" -Pattern "ok=true").Count
+          if ($ok -lt 5) { throw "only $ok of 5 options passed" }
+
+      # Real tunnels on a Wintun adapter (runners are administrators). Only
+      # 1.0.0.1 is routed through the tunnel so the runner keeps its own
+      # connection; Cloudflare's trace must say warp=on.
+      - name: Tunnel tests (each option carries real traffic)
+        run: |
+          foreach ($m in "wireguard-4500","wireguard-2408","wireguard-500","masque-h3","masque-h2") {
+            $log = "$env:RUNNER_TEMP\tunnel-$m.log"
+            $argline = "--headless --connect=$m --routes 1.0.0.1/32 --expect-warp https://1.0.0.1/cdn-cgi/trace --for 5s --log $log $env:ACCOUNTS"
+            $p = Start-Process dist\WarpGo.exe -ArgumentList $argline -Wait -PassThru -NoNewWindow
+            Get-Content $log | Select-String -Pattern "tunnel started|status:|trace|error|failed" | Select-Object -Last 8
+            if ($p.ExitCode -ne 0) { throw "$m tunnel failed" }
+            Write-Host "== $m OK"
+          }
+
+      # The whole PC through WARP, as users run it: proves the tunnel's own
+      # packets to Cloudflare stay off the tunnel (no routing loop).
+      - name: Full-tunnel test (Auto)
+        run: |
+          $log = "$env:RUNNER_TEMP\full.log"
+          $p = Start-Process dist\WarpGo.exe -ArgumentList "--headless --connect=auto --expect-warp https://www.cloudflare.com/cdn-cgi/trace --for 10s --log $log $env:ACCOUNTS" -Wait -PassThru -NoNewWindow
+          Get-Content $log | Select-String -Pattern "probe |tunnel started|status:|trace|route|error"
+          if ($p.ExitCode -ne 0) { throw "full tunnel failed" }
+          $r = route print -4 | Select-String "0.0.0.0\s+128.0.0.0"
+          if ($r) { throw "tunnel routes left behind: $r" }
+
+      - name: Screenshot of the window, connected
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory -Force "$env:APPDATA\WarpGo" | Out-Null
+          if (Test-Path "$env:RUNNER_TEMP\wg.json") {
+            $a = @{ wg = (Get-Content -Raw "$env:RUNNER_TEMP\wg.json"); wg_source = "registered"; masque = (Get-Content -Raw "$env:RUNNER_TEMP\masque.json"); masque_source = "registered" }
+            $a | ConvertTo-Json | Set-Content -Encoding utf8 "$env:APPDATA\WarpGo\accounts.json"
+          }
+          Start-Process dist\WarpGo.exe -ArgumentList "--connect"
+          Start-Sleep 35
+          powershell -NoProfile -ExecutionPolicy Bypass -File ci\screenshot.ps1 -Out dist\screenshot.png
+          Stop-Process -Name WarpGo -Force -ErrorAction SilentlyContinue
+          Start-Sleep 2
+
+      - name: Upload screenshot
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot
+          path: dist/screenshot.png
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Installer (Inno Setup)
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          } else { $iscc = (Get-Command iscc).Source }
+          & $iscc /Qp "/DAppVersion=$env:VERSION" installer\WarpGo.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed" }
+          Copy-Item dist\WarpGo.exe dist\WarpGo-Portable.exe
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Install, run and uninstall
+        run: |
+          $p = Start-Process dist\WarpGo-Setup.exe -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOLAUNCH" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "setup exit $($p.ExitCode)" }
+          $dir = "$env:ProgramFiles\WarpGo"
+          foreach ($f in "WarpGo.exe","wintun.dll","unins000.exe") { if (-not (Test-Path "$dir\$f")) { throw "missing $f" } }
+          $v = & "$dir\WarpGo.exe" --version | Out-String
+          Write-Host $v
+          if ($v -notmatch [regex]::Escape($env:VERSION)) { throw "installed version is wrong" }
+          $p = Start-Process "$dir\unins000.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART" -Wait -PassThru
+          Start-Sleep 3
+          if (Test-Path "$dir\WarpGo.exe") { throw "uninstall left WarpGo.exe" }
+
+      - name: Checksums and latest.json
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          $setup = (Get-FileHash dist\WarpGo-Setup.exe -Algorithm SHA256).Hash.ToLower()
+          $port = (Get-FileHash dist\WarpGo-Portable.exe -Algorithm SHA256).Hash.ToLower()
+          "$setup  WarpGo-Setup.exe`n$port  WarpGo-Portable.exe" | Set-Content -Encoding ascii -NoNewline dist\SHA256SUMS.txt
+          $base = "https://github.com/${{ github.repository }}/releases/download/v$env:VERSION"
+          @{ build = [int]$env:BUILD; version = $env:VERSION
+             setup = "$base/WarpGo-Setup.exe"; setup_sha256 = $setup
+             portable = "$base/WarpGo-Portable.exe"; portable_sha256 = $port
+             notes = "$env:COMMIT_MSG".Split("`n")[0] } | ConvertTo-Json | Set-Content -Encoding utf8 dist\latest.json
+          Get-Content dist\latest.json
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: WarpGo-${{ env.VERSION }}
+          path: |
+            dist/WarpGo-Setup.exe
+            dist/WarpGo-Portable.exe
+            dist/SHA256SUMS.txt
+            dist/latest.json
+          retention-days: 14
+
+      - name: Release
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          $notes = @"
+          **Download:** [WarpGo-Setup.exe](https://github.com/${{ github.repository }}/releases/download/v$env:VERSION/WarpGo-Setup.exe) (installer, recommended) or WarpGo-Portable.exe (no install).
+
+          Free Cloudflare WARP client for Windows 10/11 (x64): WireGuard + MASQUE (HTTP/3, HTTP/2) with Auto mode that tests which one really passes data on your network. Installed copies update themselves.
+
+          Windows SmartScreen may say "Windows protected your PC" because the exe is not code-signed yet: click **More info → Run anyway**. Check the download against SHA256SUMS.txt.
+
+          Change: $env:COMMIT_MSG
+          "@
+          gh release create "v$env:VERSION" dist/WarpGo-Setup.exe dist/WarpGo-Portable.exe dist/SHA256SUMS.txt dist/latest.json --title "WarpGo for Windows $env:VERSION" --notes $notes --latest

@@ -1,0 +1,9 @@
+# fetched by `go run ./tools/fetchwintun` (checksum-verified)
+internal/wintun/wintun.dll
+internal/wintun/LICENSE.txt
+# build output
+/dist/
+*.exe
+*.syso
+*.exe.old
+*.exe.new
