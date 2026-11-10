@@ -23,6 +23,10 @@
 </p>
 
 <p align="center">
+  <img src="docs/screenshot-windows.png" width="420" alt="WarpGo for Windows connected to Cloudflare WARP, showing warp=on">
+</p>
+
+<p align="center">
   <b>Website:</b> <a href="https://iknalos.github.io/WarpGo/">iknalos.github.io/WarpGo</a> ·
   <b>Android app:</b> <a href="https://github.com/iknalos/WarpGo">github.com/iknalos/WarpGo</a>
 </p>
